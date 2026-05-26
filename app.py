@@ -44,7 +44,11 @@ def extract_collection_handle(url: str) -> str | None:
 
 def extract_product_handle(url: str) -> str | None:
     m = re.search(r"/products/([^/?#]+)", url)
-    return m.group(1) if m else None
+    if not m:
+        return None
+
+    handle = m.group(1)
+    return re.sub(r"\.(?:json|js)$", "", handle)
 
 
 def log_fetch_url(url: str) -> None:
@@ -100,8 +104,8 @@ def product_to_rows(product: dict, source_url: str, base: str) -> list[dict]:
             "handle": handle,
             "variant_title": variant.get("title", ""),
             "sku": variant.get("sku", ""),
-            "price": variant.get("price", ""),
-            "compare_at_price": variant.get("compare_at_price", ""),
+            "price": money_to_string(variant.get("price")),
+            "compare_at_price": money_to_string(variant.get("compare_at_price")),
             "barcode": variant.get("barcode", ""),
             "inventory_qty": variant.get("inventory_quantity", ""),
             "product_url": f"{base}/products/{handle}",
