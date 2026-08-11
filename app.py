@@ -1,6 +1,7 @@
 import re
 import time
 import json
+from decimal import Decimal, InvalidOperation
 from urllib.parse import urlparse, urljoin
 
 import pandas as pd
@@ -12,11 +13,14 @@ from bs4 import BeautifulSoup
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/125.0.6422.80 Mobile/15E148 Safari/604.1",
     "Accept": "application/json,text/plain,*/*",
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Language": "en-IN,en;q=0.9",
     "Connection": "keep-alive",
 }
 
 FETCH_LOG_BOX = None
+DEFAULT_MARKET = "IN"
+STORE_SESSIONS = {}
+STOREFRONT_PRICE_CACHE = {}
 
 
 BOT_PROTECTION_MARKERS = (
@@ -67,15 +71,45 @@ def session_get(session: requests.Session, url: str, timeout: int):
     return session.get(url, timeout=timeout)
 
 
-def get_json(url: str, timeout: int = 20):
+def prepare_store_session(base_url: str, market: str = DEFAULT_MARKET) -> requests.Session:
+    """Return a cookie-preserving session localized for a Shopify market."""
+    base = normalize_base(base_url)
+    cache_key = (urlparse(base).netloc.lower(), (market or "").upper())
+    if cache_key in STORE_SESSIONS:
+        return STORE_SESSIONS[cache_key]
+
     session = requests.Session()
+    session.headers.update(HEADERS)
+    session.headers["Referer"] = f"{base}/"
+    try:
+        response = session_get(session, f"{base}/", timeout=20)
+        if response.status_code == 200 and not is_bot_protection_response(response.text) and market:
+            localization_url = f"{base}/localization"
+            log_fetch_url(localization_url)
+            session.post(
+                localization_url,
+                data={
+                    "form_type": "localization", "utf8": "✓",
+                    "country_code": market.upper(), "language_code": "en", "return_to": "/",
+                },
+                headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+                timeout=20,
+                allow_redirects=True,
+            )
+    except requests.RequestException as exc:
+        st.warning(f"Could not prepare {market} storefront session for {base}: {exc}")
+
+    STORE_SESSIONS[cache_key] = session
+    return session
+
+
+def get_json(url: str, timeout: int = 20, session: requests.Session | None = None):
+    session = session or prepare_store_session(normalize_base(url))
     json_headers = HEADERS.copy()
     json_headers.update({
         "Accept": "application/json,text/plain,*/*",
         "Referer": f"{normalize_base(url)}/",
     })
-    session.headers.update(json_headers)
-
     response = session_get(session, url, timeout=timeout)
 
     if is_bot_protection_response(response.text):
@@ -399,10 +433,136 @@ def extract_json_ld_products(soup: BeautifulSoup) -> list[dict]:
     return products
 
 
-def scrape_product_html(product_url: str, source_url: str | None = None) -> list[dict]:
+def _valid_price(value, cents: bool = False) -> str:
+    if value is None or isinstance(value, bool):
+        return ""
+    raw = str(value).strip().replace(",", "")
+    match = re.search(r"\d+(?:\.\d+)?", raw)
+    if not match:
+        return ""
+    try:
+        amount = Decimal(match.group(0))
+        if cents:
+            amount /= 100
+        if amount <= 0:
+            return ""
+        return f"{amount:.2f}"
+    except (InvalidOperation, ValueError):
+        return ""
+
+
+def extract_storefront_prices(soup: BeautifulSoup) -> dict:
+    """Extract the localized storefront price without converting currencies."""
+    currency = get_meta_content(soup, "product:price:currency", "og:price:currency")
+    candidates = []
+    offer_prices = {}
+
+    for product in extract_json_ld_products(soup):
+        offers = product.get("offers") or []
+        if isinstance(offers, dict):
+            offers = [offers]
+        for offer in offers:
+            if not isinstance(offer, dict):
+                continue
+            offer_currency = offer.get("priceCurrency") or currency
+            price = _valid_price(offer.get("price") or offer.get("lowPrice"))
+            if price:
+                candidates.append((price, "json-ld", offer_currency))
+                key = str(offer.get("sku") or offer.get("@id") or "")
+                if key:
+                    offer_prices[key] = {"price": price, "compare_at_price": ""}
+
+    meta_price = _valid_price(get_meta_content(soup, "product:price:amount", "og:price:amount"))
+    if meta_price:
+        candidates.append((meta_price, "meta", currency))
+
+    theme_compare = ""
+    for product in extract_shopify_products_from_scripts(soup):
+        for variant in product.get("variants") or []:
+            price = _valid_price(variant.get("price"), cents=isinstance(variant.get("price"), int))
+            compare = _valid_price(
+                variant.get("compare_at_price"),
+                cents=isinstance(variant.get("compare_at_price"), int),
+            )
+            if price:
+                candidates.append((price, "theme-json", currency))
+                key = str(variant.get("sku") or variant.get("id") or "")
+                if key:
+                    offer_prices[key] = {"price": price, "compare_at_price": compare}
+            if compare and not theme_compare:
+                theme_compare = compare
+
+    if not candidates:
+        sale_tag = soup.select_one('.price-item--sale, [class*="price"][class*="sale"]')
+        regular_tag = soup.select_one('.price-item--regular, [class*="price"][class*="compare"]')
+        price_tag = sale_tag or soup.select_one(
+            '[data-product-price], [data-price][class*="price"], '
+            '.price-item--regular, [class*="product__price"]'
+        )
+        visible_price = _valid_price(price_tag.get_text(" ", strip=True) if price_tag else "")
+        if visible_price:
+            candidates.append((visible_price, "visible-markup", currency))
+            regular_price = _valid_price(regular_tag.get_text(" ", strip=True) if regular_tag else "")
+            if sale_tag and regular_price and regular_price != visible_price:
+                theme_compare = regular_price
+
+    selected = candidates[0] if candidates else ("", "", currency)
+    if currency:
+        selected = next((item for item in candidates if (item[2] or "").upper() == currency.upper()), selected)
+    price, source, selected_currency = selected
+    return {
+        "price": price,
+        "compare_at_price": theme_compare,
+        "currency": (selected_currency or currency or "").upper(),
+        "source": source,
+        "offers": offer_prices,
+    }
+
+
+def reconcile_storefront_prices(
+    rows: list[dict], product_url: str, session: requests.Session, market: str = DEFAULT_MARKET
+) -> list[dict]:
+    cache_key = (product_url.split("?", 1)[0], market.upper())
+    if cache_key not in STOREFRONT_PRICE_CACHE:
+        try:
+            soup = BeautifulSoup(get_html(product_url, session=session), "html.parser")
+            STOREFRONT_PRICE_CACHE[cache_key] = extract_storefront_prices(soup)
+        except Exception as exc:
+            st.warning(f"Could not read localized storefront price for {product_url}: {exc}")
+            STOREFRONT_PRICE_CACHE[cache_key] = {}
+
+    storefront = STOREFRONT_PRICE_CACHE[cache_key]
+    currency = storefront.get("currency", "")
+    if market.upper() == "IN" and currency and currency != "INR":
+        st.warning(f"India storefront currency for {product_url} is {currency}, not INR; retaining raw Shopify prices.")
+
+    for row in rows:
+        offer = storefront.get("offers", {}).get(str(row.get("sku", "")), {})
+        storefront_price = offer.get("price") or storefront.get("price", "")
+        storefront_compare = offer.get("compare_at_price") or storefront.get("compare_at_price", "")
+        use_storefront = bool(storefront_price and (market.upper() != "IN" or currency == "INR"))
+        if use_storefront:
+            row["price"] = storefront_price
+            if storefront_compare:
+                row["compare_at_price"] = storefront_compare
+    return rows
+
+
+def reconcile_product_rows(rows: list[dict], session: requests.Session, market: str = DEFAULT_MARKET) -> list[dict]:
+    grouped = {}
+    for row in rows:
+        product_url = row.get("product_url", "")
+        if product_url:
+            grouped.setdefault(product_url, []).append(row)
+    for product_url, product_rows in grouped.items():
+        reconcile_storefront_prices(product_rows, product_url, session, market)
+    return rows
+
+
+def scrape_product_html(product_url: str, source_url: str | None = None, session: requests.Session | None = None) -> list[dict]:
     base = normalize_base(product_url)
     source_url = source_url or product_url
-    soup = BeautifulSoup(get_html(product_url), "html.parser")
+    soup = BeautifulSoup(get_html(product_url, session=session), "html.parser")
     rows = []
 
     for product in extract_shopify_products_from_scripts(soup):
@@ -417,29 +577,29 @@ def scrape_product_html(product_url: str, source_url: str | None = None) -> list
     return rows or fallback_html_page_to_rows(soup, product_url, source_url, base)
 
 
-def scrape_product_json(product_url: str, source_url: str | None = None) -> list[dict]:
+def scrape_product_json(product_url: str, source_url: str | None = None, session: requests.Session | None = None) -> list[dict]:
     base = normalize_base(product_url)
     handle = extract_product_handle(product_url)
     if not handle:
         return []
 
-    product = get_json(f"{base}/products/{handle}.js")
+    product = get_json(f"{base}/products/{handle}.js", session=session)
     return product_to_rows(product, source_url or product_url, base)
 
 
 def scrape_product(product_url: str, source_url: str | None = None) -> list[dict]:
+    session = prepare_store_session(normalize_base(product_url), DEFAULT_MARKET)
     try:
-        return scrape_product_json(product_url, source_url=source_url)
+        rows = scrape_product_json(product_url, source_url=source_url, session=session)
     except Exception:
-        return scrape_product_html(product_url, source_url=source_url)
+        rows = scrape_product_html(product_url, source_url=source_url, session=session)
+    return reconcile_storefront_prices(rows, product_url, session, DEFAULT_MARKET)
 
 
-def get_html(url: str, timeout: int = 20) -> str:
-    session = requests.Session()
+def get_html(url: str, timeout: int = 20, session: requests.Session | None = None) -> str:
+    session = session or prepare_store_session(normalize_base(url))
     html_headers = HEADERS.copy()
     html_headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    session.headers.update(html_headers)
-
     response = session_get(session, url, timeout=timeout)
     if is_bot_protection_response(response.text):
         raise Exception("Store returned a bot-protection challenge instead of HTML")
@@ -450,13 +610,13 @@ def get_html(url: str, timeout: int = 20) -> str:
     return response.text
 
 
-def get_collection_html_soup(collection_url: str, page: int) -> tuple[BeautifulSoup, str]:
+def get_collection_html_soup(collection_url: str, page: int, session: requests.Session | None = None) -> tuple[BeautifulSoup, str]:
     if page == 1:
-        return BeautifulSoup(get_html(collection_url), "html.parser"), collection_url
+        return BeautifulSoup(get_html(collection_url, session=session), "html.parser"), collection_url
 
     separator = "&" if "?" in collection_url else "?"
     html_url = f"{collection_url}{separator}page={page}"
-    return BeautifulSoup(get_html(html_url), "html.parser"), html_url
+    return BeautifulSoup(get_html(html_url, session=session), "html.parser"), html_url
 
 
 def collect_product_links_from_collection_soup(soup: BeautifulSoup, html_url: str) -> list[str]:
@@ -509,9 +669,12 @@ def collect_product_links_from_collection_soup(soup: BeautifulSoup, html_url: st
     return links
 
 
-def scrape_collection_html_page(collection_url: str, page: int, seen_handles: set[str], delay: float) -> list[dict]:
+def scrape_collection_html_page(
+    collection_url: str, page: int, seen_handles: set[str], delay: float,
+    session: requests.Session | None = None,
+) -> list[dict]:
     base = normalize_base(collection_url)
-    soup, html_url = get_collection_html_soup(collection_url, page)
+    soup, html_url = get_collection_html_soup(collection_url, page, session=session)
     rows = []
 
     for product in extract_shopify_products_from_scripts(soup):
@@ -539,7 +702,7 @@ def scrape_collection_html_page(collection_url: str, page: int, seen_handles: se
         seen_handles.add(handle)
 
         try:
-            product_rows = scrape_product_json(product_link, source_url=collection_url)
+            product_rows = scrape_product_json(product_link, source_url=collection_url, session=session)
         except Exception as product_error:
             st.warning(f"Skipping product {product_link}: /products/<handle>.js failed: {product_error}")
             continue
@@ -558,16 +721,17 @@ def scrape_collection_products(collection_url: str, max_pages: int = 20, delay: 
 
     all_rows = []
     seen_handles = set()
+    session = prepare_store_session(base, DEFAULT_MARKET)
 
     for page in range(1, max_pages + 1):
         api_url = f"{base}/collections/{collection}/products.json?page={page}"
         try:
-            data = get_json(api_url)
+            data = get_json(api_url, session=session)
             products = data.get("products", [])
         except Exception as e:
             st.warning(f"Could not read page {page} products.json: {e}. Reading collection page HTML.")
             try:
-                page_rows = scrape_collection_html_page(collection_url, page, seen_handles, delay)
+                page_rows = scrape_collection_html_page(collection_url, page, seen_handles, delay, session=session)
             except Exception as html_error:
                 st.warning(f"Could not read page {page} HTML fallback: {html_error}")
                 break
@@ -575,7 +739,7 @@ def scrape_collection_products(collection_url: str, max_pages: int = 20, delay: 
             if not page_rows:
                 break
 
-            all_rows.extend(page_rows)
+            all_rows.extend(reconcile_product_rows(page_rows, session, DEFAULT_MARKET))
             continue
 
         if not products:
@@ -587,7 +751,9 @@ def scrape_collection_products(collection_url: str, max_pages: int = 20, delay: 
                 continue
             seen_handles.add(handle)
 
-            all_rows.extend(product_to_rows(p, collection_url, base))
+            product_rows = product_to_rows(p, collection_url, base)
+            product_url = f"{base}/products/{handle}"
+            all_rows.extend(reconcile_storefront_prices(product_rows, product_url, session, DEFAULT_MARKET))
 
         time.sleep(delay)
 
